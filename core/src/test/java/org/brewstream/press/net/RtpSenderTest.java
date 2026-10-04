@@ -167,6 +167,36 @@ class RtpSenderTest {
         }
     }
 
+    /**
+     * The building block a relay is made of: a receiver's in-order payloads
+     * written straight into a sender. Which outputs a stream goes to, and when,
+     * is BrewStream's business; Press only has to make this hop lossless.
+     */
+    @Test
+    void aReceiversPayloadsCanFeedASender() throws Exception {
+        startReceiver(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, 0)));
+        sender = RtpSender.connect(RtpSenderConfig.to(receiver.localAddress()));
+        RtpReceiver ingest = RtpReceiver.bind(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, 0)),
+                pipeline -> pipeline.addLast(new io.netty.channel.SimpleChannelInboundHandler<io.netty.buffer.ByteBuf>(
+                        false) {
+                    @Override
+                    protected void channelRead0(io.netty.channel.ChannelHandlerContext ctx,
+                            io.netty.buffer.ByteBuf payload) {
+                        sender.write(payload);
+                    }
+                }));
+        try (RtpSender source = RtpSender.connect(RtpSenderConfig.to(ingest.localAddress()))) {
+            byte[] stream = tsBytes(7 * 40);
+
+            source.write(Unpooled.wrappedBuffer(stream));
+
+            awaitBytes(stream.length);
+            assertThat(receivedBytes()).isEqualTo(stream);
+        } finally {
+            ingest.close();
+        }
+    }
+
     @Test
     void refusesFecMatricesOutsideTheStandard() {
         RtpSenderConfig config = RtpSenderConfig.to(new InetSocketAddress(LOOPBACK, 5000));

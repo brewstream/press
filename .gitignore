@@ -1,0 +1,13 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+.DS_Store
+
+# Specs and reference implementations fetched locally (RFCs, ffmpeg's prompeg.c,
+# GStreamer's ST 2022-1 elements). Consulted, not ours to redistribute.
+/references/
+
+# Local agent notes, kept out of the repository as in Roast.
+CLAUDE.md

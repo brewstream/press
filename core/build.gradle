@@ -1,0 +1,56 @@
+apply plugin: 'com.vanniktech.maven.publish'
+
+description = 'Pure-Java RTP transport for MPEG-TS: RFC 3550, SMPTE 2022-1 FEC and 2022-2'
+
+dependencies {
+    // api: ByteBuf and ChannelPipeline are part of Press's public API.
+    api platform('io.netty:netty-bom:4.2.17.Final')
+    api 'io.netty:netty-buffer'
+    api 'io.netty:netty-transport'
+    implementation 'io.netty:netty-common'
+
+    // Tests check what arrives is a healthy transport stream, which is Grind's job.
+    testImplementation 'io.github.brewstream:grind-core:0.1.1'
+}
+
+base {
+    archivesName = 'press'
+}
+
+mavenPublishing {
+    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL)
+    if (project.findProperty('signing.gnupg.keyName') || project.findProperty('signingInMemoryKey')) {
+        signAllPublications()
+    }
+
+    coordinates(project.group.toString(), 'press', project.version.toString())
+
+    pom {
+        name = 'Press'
+        description = project.description
+        url = 'https://github.com/brewstream/press'
+        inceptionYear = '2026'
+
+        licenses {
+            license {
+                name = 'The Apache License, Version 2.0'
+                url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                distribution = 'repo'
+            }
+        }
+
+        developers {
+            developer {
+                id = 'viniciusccarvalho'
+                name = 'Vinicius Carvalho'
+                url = 'https://github.com/viniciusccarvalho'
+            }
+        }
+
+        scm {
+            connection = 'scm:git:git://github.com/brewstream/press.git'
+            developerConnection = 'scm:git:ssh://github.com:brewstream/press.git'
+            url = 'https://github.com/brewstream/press'
+        }
+    }
+}

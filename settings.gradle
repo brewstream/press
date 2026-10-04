@@ -1,0 +1,3 @@
+rootProject.name = 'press'
+
+include 'core'

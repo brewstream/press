@@ -310,6 +310,133 @@ class RtpReceiverTest {
         return null;
     }
 
+    /**
+     * A handler added in the bind initializer sees every packet: the media socket
+     * reads nothing until the initializer has run. Packets already flowing when
+     * the receiver binds queue in the socket and are delivered to it.
+     */
+    @Test
+    void handlersAddedAtBindSeeEveryPacketDelivered() throws Exception {
+        int port = freePortPair();
+        java.util.concurrent.atomic.AtomicLong seen = new java.util.concurrent.atomic.AtomicLong();
+        try (Blaster blaster = new Blaster(port)) {
+            Thread.sleep(50);
+            receiver = RtpReceiver.bind(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, port)),
+                    pipeline -> pipeline.addLast(counter(seen)));
+            Thread.sleep(200);
+        }
+        Thread.sleep(200);
+
+        assertThat(receiver.stats().packetsDelivered()).isPositive();
+        assertThat(seen.get()).isEqualTo(receiver.stats().packetsDelivered());
+    }
+
+    /**
+     * Netty adds a handler from another thread asynchronously, and packets read
+     * before it is in place pass it by. Linux CI hit that by chance before onData
+     * waited for the add. The window is too narrow to hit on purpose, so this
+     * tests the guarantee directly: with the event loop held busy the handler
+     * cannot be added, so onData must not have returned; once the loop is free
+     * it returns, and a packet sent afterwards reaches the handler.
+     */
+    @Test
+    void onDataReturnsOnlyOnceItsHandlerIsInPlace() throws Exception {
+        // A bare receiver: start()'s own onData handler would consume everything first.
+        receiver = RtpReceiver.bind(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, 0)).withRtcp(false));
+        sender = new DatagramSocket(0, LOOPBACK);
+        BlockingQueue<Integer> seen = new LinkedBlockingQueue<>();
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        receiver.channel().eventLoop().execute(() -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        try {
+            java.util.concurrent.CompletableFuture<Void> added =
+                    java.util.concurrent.CompletableFuture.runAsync(() -> {
+                        try {
+                            receiver.onData(payload -> {
+                                seen.add((int) payload.getUnsignedByte(payload.readerIndex() + 1));
+                                payload.release();
+                            });
+                        } catch (InterruptedException e) {
+                            throw new IllegalStateException(e);
+                        }
+                    });
+            Thread.sleep(200);
+            assertThat(added).as("onData returned while its handler could not have been added").isNotDone();
+
+            release.countDown();
+            added.get(5, TimeUnit.SECONDS);
+        } finally {
+            release.countDown(); // never leave the loop parked, or close() would wait forever
+        }
+        send(SSRC, 7);
+        assertThat(seen.poll(5, TimeUnit.SECONDS)).isEqualTo(7);
+    }
+
+    private static void sendTo(DatagramSocket socket, int port, ByteBuf wire) throws IOException {
+        byte[] bytes = ByteBufUtil.getBytes(wire);
+        wire.release();
+        socket.send(new DatagramPacket(bytes, bytes.length, LOOPBACK, port));
+    }
+
+    private static io.netty.channel.ChannelHandler counter(java.util.concurrent.atomic.AtomicLong seen) {
+        return new io.netty.channel.SimpleChannelInboundHandler<ByteBuf>() {
+            @Override
+            protected void channelRead0(io.netty.channel.ChannelHandlerContext ctx, ByteBuf payload) {
+                seen.incrementAndGet();
+            }
+        };
+    }
+
+    /** Sends in-sequence RTP packets to a port as fast as it can until closed. */
+    private static final class Blaster implements AutoCloseable {
+        private final Thread thread;
+        private volatile boolean running = true;
+
+        Blaster(int port) {
+            thread = new Thread(() -> {
+                try (DatagramSocket socket = new DatagramSocket(0, LOOPBACK)) {
+                    for (int seq = 0; running; seq++) {
+                        ByteBuf wire = rtp(SSRC, seq);
+                        byte[] bytes = ByteBufUtil.getBytes(wire);
+                        wire.release();
+                        socket.send(new DatagramPacket(bytes, bytes.length, LOOPBACK, port));
+                        if (seq % 16 == 0) {
+                            Thread.sleep(1);
+                        }
+                    }
+                } catch (IOException | InterruptedException e) {
+                    // stop
+                }
+            }, "rtp-blaster");
+            thread.start();
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            running = false;
+            thread.join();
+        }
+    }
+
+    /** A free even port P with P+1 free too, released for the receiver to take. */
+    private static int freePortPair() throws IOException {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            int port;
+            try (DatagramSocket probe = new DatagramSocket(0, LOOPBACK)) {
+                port = probe.getLocalPort() & ~1;
+            }
+            if (port > 0 && canBind(port) && canBind(port + 1)) {
+                return port;
+            }
+        }
+        throw new IOException("no free port pair");
+    }
+
     // --- helpers -------------------------------------------------------------
 
     private void start(RtpReceiverConfig config) throws Exception {

@@ -21,21 +21,28 @@ Java 21 or newer. Netty 4.2 is the only runtime dependency.
 ## Receiving
 
 ```java
-RtpReceiver receiver = RtpReceiver.bind(RtpReceiverConfig.unicast(5000));
-
 TsAnalyzer analyzer = new TsAnalyzer();
-receiver.pipeline().addLast(new MpegTsDecoder(analyzer), new TsHealthHandler(analyzer));
+RtpReceiver receiver = RtpReceiver.bind(RtpReceiverConfig.unicast(5000),
+        pipeline -> pipeline.addLast(new MpegTsDecoder(analyzer), new TsHealthHandler(analyzer)));
 ```
 
-Handlers added to `pipeline()` receive each packet's payload as a `ByteBuf`,
-in sequence order: normally seven 188-byte TS packets. Whoever consumes a buffer
-releases it. For a callback instead of a handler:
+Handlers receive each packet's payload as a `ByteBuf`, in sequence order:
+normally seven 188-byte TS packets. Whoever consumes a buffer releases it.
+
+Add handlers in the initializer, as above. It runs on the receiver's event loop
+before the first packet is read, so the handlers see the stream from its start.
+A handler added to `pipeline()` later, from another thread, is added
+asynchronously by Netty, and packets read in the meantime pass it by. For a
+callback instead of a handler:
 
 ```java
 receiver.onData(payload -> {
     forward(payload);   // takes ownership
 });
 ```
+
+`onData` adds its handler on the event loop and returns once it is in place, so
+every packet delivered after it returns reaches the callback.
 
 Multicast, including source-specific:
 

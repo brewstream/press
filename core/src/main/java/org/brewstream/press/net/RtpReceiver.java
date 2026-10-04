@@ -19,6 +19,7 @@ package org.brewstream.press.net;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOption;
@@ -152,14 +153,39 @@ public final class RtpReceiver implements AutoCloseable {
 
     /** Binds a receiver on its own event loop group, shut down when the receiver closes. */
     public static RtpReceiver bind(RtpReceiverConfig config) throws InterruptedException {
-        return bind(config, PressTransport.owned());
+        return bind(config, PressTransport.owned(), pipeline -> { });
+    }
+
+    /**
+     * Binds a receiver whose pipeline is set up before the first packet is read,
+     * so no packet can arrive ahead of the handlers meant to see it.
+     *
+     * <pre>{@code
+     * RtpReceiver.bind(config, pipeline -> pipeline.addLast(new MpegTsDecoder(analyzer)));
+     * }</pre>
+     *
+     * @param initializer runs once, on the receiver's event loop, before reading starts
+     */
+    public static RtpReceiver bind(RtpReceiverConfig config, Consumer<ChannelPipeline> initializer)
+            throws InterruptedException {
+        return bind(config, PressTransport.owned(), initializer);
     }
 
     /** Binds a receiver on the given transport. A shared group is never shut down by Press. */
     public static RtpReceiver bind(RtpReceiverConfig config, PressTransport transport) throws InterruptedException {
+        return bind(config, transport, pipeline -> { });
+    }
+
+    /** Binds a receiver on the given transport, with its pipeline set up before reading starts. */
+    public static RtpReceiver bind(RtpReceiverConfig config, PressTransport transport,
+            Consumer<ChannelPipeline> initializer) throws InterruptedException {
         RtpReceiver receiver = new RtpReceiver(config, transport);
         try {
             receiver.open();
+            receiver.loop.submit(() -> {
+                initializer.accept(receiver.media.pipeline());
+                receiver.media.config().setAutoRead(true);
+            }).sync();
         } catch (InterruptedException | RuntimeException e) {
             receiver.close();
             throw e;
@@ -168,8 +194,13 @@ public final class RtpReceiver implements AutoCloseable {
     }
 
     /**
-     * The media socket's pipeline. Add handlers with {@code addLast}; they receive
-     * in-order payload {@link ByteBuf}s and must release them.
+     * The media socket's pipeline. Handlers added after Press's receive in-order
+     * payload {@link ByteBuf}s and must release them.
+     *
+     * <p>Reading has already started by the time {@code bind} returns, and Netty
+     * adds a handler from another thread asynchronously, so packets that arrive
+     * in the meantime pass it by. To see a stream from its first packet, add
+     * handlers in the initializer of {@link #bind(RtpReceiverConfig, Consumer)}.
      */
     public ChannelPipeline pipeline() {
         return media.pipeline();
@@ -183,14 +214,21 @@ public final class RtpReceiver implements AutoCloseable {
     /**
      * Calls {@code handler} with each in-order payload: a shortcut for a handler at
      * the end of the pipeline. The handler owns each buffer and must release it.
+     * Every packet delivered after this returns reaches it, because the handler
+     * is added on the event loop and this waits until it is in place.
      */
-    public void onData(Consumer<ByteBuf> handler) {
-        pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>(false) {
+    public void onData(Consumer<ByteBuf> handler) throws InterruptedException {
+        ChannelHandler tail = new SimpleChannelInboundHandler<ByteBuf>(false) {
             @Override
             protected void channelRead0(ChannelHandlerContext ctx, ByteBuf payload) {
                 handler.accept(payload);
             }
-        });
+        };
+        if (loop.inEventLoop()) {
+            pipeline().addLast(tail);
+        } else {
+            loop.submit(() -> pipeline().addLast(tail)).sync();
+        }
     }
 
     public void addListener(RtpReceiverListener listener) {
@@ -294,11 +332,15 @@ public final class RtpReceiver implements AutoCloseable {
     }
 
     private DatagramChannel bindChannel(int port, ChannelInboundHandlerAdapter handler) throws InterruptedException {
+        // The media socket starts paused, and reading begins once bind has run the
+        // pipeline initializer. RTCP and FEC sockets have no user handlers to wait for.
+        boolean paused = handler instanceof MediaHandler;
         boolean multicast = config.multicastGroup() != null;
         InetSocketAddress local = new InetSocketAddress(config.bindAddress().getAddress(), port);
         ChannelFuture bound = transport.bootstrap(loop, multicast ? config.multicastGroup() : null)
                 .option(ChannelOption.SO_RCVBUF, config.receiveBufferBytes())
                 .option(ChannelOption.SO_REUSEADDR, multicast)
+                .option(ChannelOption.AUTO_READ, !paused)
                 .handler(handler)
                 .bind(local)
                 .await();

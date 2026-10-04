@@ -45,6 +45,16 @@ public interface RtpReceiverListener {
     default void onLoss(RtpReceiver receiver, long firstExtendedSeq, int count) {
     }
 
+    /**
+     * FEC rebuilt a missing packet in time for it to be delivered in its place.
+     * FEC arrives on other ports and can overtake the media it protects, so the
+     * original may still turn up afterwards; it is then discarded, and taken out
+     * of {@link ReceiverStats#packetsRecovered()}. Recoveries that come too late
+     * are only counted, in {@link ReceiverStats#packetsRecoveredLate()}.
+     */
+    default void onRecovered(RtpReceiver receiver, long extendedSeq) {
+    }
+
     /** An RTCP sender report arrived from the source. */
     default void onSenderReport(RtpReceiver receiver, RtcpPacket.SenderReport report) {
     }

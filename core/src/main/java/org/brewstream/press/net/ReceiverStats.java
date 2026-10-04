@@ -45,6 +45,14 @@ import java.net.InetSocketAddress;
  * @param sourceChanges    times the receiver moved to a new SSRC, or resynchronised after the
  *                         same SSRC restarted its sequence numbers
  * @param senderReports    RTCP sender reports received from the source
+ * @param fecPackets       SMPTE 2022-1 FEC packets received, both directions
+ * @param packetsRecovered media packets rebuilt from FEC whose original never arrived. FEC
+ *                         travels on other ports and can overtake the media it protects; a
+ *                         packet rebuilt that way and then received is not counted
+ * @param packetsRecoveredLate rebuilt, but after delivery had given up on them: the latency
+ *                         is too short for the FEC matrix. Counted in {@code packetsRecovered} too
+ * @param fecColumns       L, the FEC matrix's row length, as the sender's FEC packets say; 0 without FEC
+ * @param fecRows          D, its column length; 0 without column FEC
  */
 public record ReceiverStats(
         long ssrc,
@@ -60,5 +68,10 @@ public record ReceiverStats(
         long networkLost,
         long jitterMicros,
         long sourceChanges,
-        long senderReports) {
+        long senderReports,
+        long fecPackets,
+        long packetsRecovered,
+        long packetsRecoveredLate,
+        int fecColumns,
+        int fecRows) {
 }

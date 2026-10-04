@@ -88,8 +88,6 @@ public final class SequenceTracker {
             restarted = true;
             extended = seq;
         } else {
-            // Behind maxSeq: a duplicate or a reordered packet. If it is
-            // numerically above maxSeq, it is from before the last wrap.
             extended = seq > maxSeq ? cycles - SEQ_MOD + seq : cycles + seq;
         }
         received++;

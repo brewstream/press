@@ -71,9 +71,13 @@ class RtpReceiverFecTest {
             assertThat(got.get(i)).as("packet " + i).isEqualTo(i & 0xFF);
         }
         ReceiverStats stats = receiver.stats();
-        assertThat(stats.packetsRecovered()).isEqualTo(lost.size());
+        // Loopback can drop a packet of its own under load; FEC recovers that one too.
+        // What must hold is that every packet the network lost was recovered, and
+        // that a recovery the original overtook was not counted.
+        assertThat(stats.networkLost()).as("the network still lost them").isGreaterThanOrEqualTo(lost.size());
+        assertThat(stats.packetsRecovered()).as(stats.toString()).isEqualTo(stats.networkLost());
+        assertThat(stats.packetsLost()).isZero();
         assertThat(stats.packetsRecoveredLate()).isZero();
-        assertThat(stats.networkLost()).as("the network still lost them").isEqualTo(lost.size());
         assertThat(stats.fecColumns()).isEqualTo(L);
         assertThat(stats.fecRows()).isEqualTo(D);
         // Events fire on recovery; FEC that overtook its media can add some for packets never lost.
@@ -156,6 +160,8 @@ class RtpReceiverFecTest {
                 wire.clear();
                 if (pauseMillis > 0) {
                     Thread.sleep(pauseMillis);
+                } else if (seq % 10 == 9) {
+                    Thread.sleep(1); // a burst, but not one a loaded machine's loopback drops from
                 }
             }
             encoder.close();

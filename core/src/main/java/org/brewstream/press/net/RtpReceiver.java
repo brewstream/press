@@ -334,7 +334,7 @@ public final class RtpReceiver implements AutoCloseable {
                 try {
                     bindCompanions(port);
                     return;
-                } catch (ChannelBindException e) {
+                } catch (Channels.BindFailed e) {
                     // One of the ports above is taken; try another P.
                 }
             }
@@ -384,7 +384,7 @@ public final class RtpReceiver implements AutoCloseable {
                 .bind(local)
                 .await();
         if (!bound.isSuccess()) {
-            throw new ChannelBindException(local, bound.cause());
+            throw new Channels.BindFailed(local, bound.cause());
         }
         DatagramChannel channel = (DatagramChannel) bound.channel();
         if (multicast) {
@@ -403,13 +403,6 @@ public final class RtpReceiver implements AutoCloseable {
             }
         }
         return channel;
-    }
-
-    /** A port that could not be bound, kept distinct so the ephemeral search can retry. */
-    static final class ChannelBindException extends IllegalStateException {
-        ChannelBindException(InetSocketAddress address, Throwable cause) {
-            super("could not bind " + address, cause);
-        }
     }
 
     // --- media path ----------------------------------------------------------

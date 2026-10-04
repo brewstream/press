@@ -162,12 +162,16 @@ public final class RtpSender implements AutoCloseable {
         }
     }
 
-    /** Sends whatever is waiting for a full packet now, as a shorter one. */
+    /**
+     * Sends the whole TS packets waiting for a full RTP packet now, as a shorter
+     * one. An incomplete TS packet at the end stays for the next write: RFC 2250
+     * §2 allows only whole transport packets in a payload.
+     */
     public void flush() {
         if (loop.inEventLoop()) {
-            sendPending();
+            sendWholeTsPackets();
         } else {
-            loop.execute(this::sendPending);
+            loop.execute(this::sendWholeTsPackets);
         }
     }
 
@@ -202,26 +206,38 @@ public final class RtpSender implements AutoCloseable {
         return finalStats;
     }
 
-    /** Sends what is pending and a final SR with BYE, then closes. The ports are free when this returns. */
+    /**
+     * Sends the whole TS packets still pending and a final SR with BYE, then
+     * closes. An incomplete TS packet at the very end is discarded, since sending
+     * it would break RFC 2250.
+     *
+     * <p>Called from any other thread, this returns once the ports can be bound
+     * again. Called on the sender's own event loop it cannot wait for that without
+     * blocking the loop it would wait on, so the sockets close as soon as the loop
+     * is free and this returns at once.
+     */
     @Override
     public void close() throws InterruptedException {
         if (closed) {
             return;
         }
         closed = true;
+        if (loop.inEventLoop()) {
+            finishOnLoop();
+            if (rtcp != null) {
+                rtcp.close();
+            }
+            if (media != null) {
+                media.close();
+            }
+            if (transport.shutdownWithOwner()) {
+                transport.eventLoopGroup().shutdownGracefully(0, 2, TimeUnit.SECONDS);
+            }
+            return;
+        }
         if (!loop.isShuttingDown()) {
             try {
-                loop.submit(() -> {
-                    if (reportTimer != null) {
-                        reportTimer.cancel(false);
-                    }
-                    sendPending();
-                    sendReport(true);
-                    if (fec != null) {
-                        fec.close();
-                    }
-                    finalStats = snapshot();
-                }).sync();
+                loop.submit(this::finishOnLoop).sync();
             } catch (java.util.concurrent.RejectedExecutionException e) {
                 // The group was shut down under us.
             }
@@ -231,6 +247,24 @@ public final class RtpSender implements AutoCloseable {
         if (transport.shutdownWithOwner()) {
             transport.eventLoopGroup().shutdownGracefully(0, 2, TimeUnit.SECONDS).sync();
         }
+    }
+
+    /** The part of closing that touches sender state, so runs on the loop. */
+    private void finishOnLoop() {
+        if (reportTimer != null) {
+            reportTimer.cancel(false);
+        }
+        sendWholeTsPackets();
+        if (pending != null) {
+            LOG.fine(() -> "discarding " + pending.readableBytes() + " bytes of an incomplete final TS packet");
+            pending.release();
+            pending = null;
+        }
+        sendReport(true);
+        if (fec != null) {
+            fec.close();
+        }
+        finalStats = snapshot();
     }
 
     // --- binding -------------------------------------------------------------
@@ -309,6 +343,25 @@ public final class RtpSender implements AutoCloseable {
         } finally {
             ts.release();
         }
+    }
+
+    /** Sends the whole TS packets in {@link #pending}, keeping any incomplete one after them. */
+    private void sendWholeTsPackets() {
+        if (pending == null) {
+            return;
+        }
+        int whole = pending.readableBytes() / TS_PACKET * TS_PACKET;
+        if (whole == 0) {
+            return;
+        }
+        ByteBuf rest = null;
+        if (whole < pending.readableBytes()) {
+            rest = media.alloc().buffer(packetBytes);
+            rest.writeBytes(pending, pending.readerIndex() + whole, pending.readableBytes() - whole);
+            pending.writerIndex(pending.readerIndex() + whole);
+        }
+        sendPending();
+        pending = rest;
     }
 
     private void sendPending() {

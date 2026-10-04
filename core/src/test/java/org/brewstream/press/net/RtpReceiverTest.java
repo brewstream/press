@@ -249,6 +249,36 @@ class RtpReceiverTest {
         assertThat(canBind(base + 1)).isTrue();
     }
 
+    /** close() from a listener runs on the receiver's own loop; it must not throw or leave sockets open. */
+    @Test
+    void closesFromItsOwnEventLoop() throws Exception {
+        start(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, 0)));
+        int base = receiver.localAddress().getPort();
+        java.util.concurrent.CompletableFuture<Throwable> closedFromListener = new java.util.concurrent.CompletableFuture<>();
+        receiver.addListener(new RtpReceiverListener() {
+            @Override
+            public void onSourceChanged(RtpReceiver r, long previous, long ssrc, InetSocketAddress source) {
+                try {
+                    r.close();
+                    closedFromListener.complete(null);
+                } catch (Throwable t) {
+                    closedFromListener.complete(t);
+                }
+            }
+        });
+
+        send(SSRC, 1);
+
+        assertThat(closedFromListener.get(5, TimeUnit.SECONDS)).isNull();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!(canBind(base) && canBind(base + 1)) && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(canBind(base)).isTrue();
+        assertThat(canBind(base + 1)).isTrue();
+        receiver = null;
+    }
+
     @Test
     void statsSurviveClose() throws Exception {
         start(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, 0)));

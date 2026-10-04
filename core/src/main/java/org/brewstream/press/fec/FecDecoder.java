@@ -54,6 +54,13 @@ public final class FecDecoder {
         void recovered(long extendedSeq, RtpPacket packet);
     }
 
+    /**
+     * FEC packets waiting for their row or column to become recoverable. A 2022-1
+     * matrix has at most 40 (L + D, each at most 20), and two or three matrices are
+     * ever in play, so this is several times what a real sender produces.
+     */
+    static final int MAX_PENDING = 256;
+
     private final int capacity;
     private final int mask;
     private final Sink sink;
@@ -121,9 +128,15 @@ public final class FecDecoder {
             return;
         }
         Pending candidate = new Pending(fec, extend(fec.snBase()));
-        if (candidate.last() <= highestSeq - capacity) {
-            fec.payload().release(); // covers only packets already forgotten
+        if (candidate.last() <= highestSeq - capacity     // covers only packets already forgotten
+                || candidate.base() > highestSeq + capacity // far beyond anything sent; not this stream
+                || isPending(candidate)) {                  // a repeat of one already waiting
+            fec.payload().release();
             return;
+        }
+        if (pending.size() >= MAX_PENDING) {
+            // Expiry follows media, so with media stalled only a cap bounds this.
+            pending.removeFirst().fec().payload().release();
         }
         pending.add(candidate);
         ArrayDeque<Long> recoveredNow = new ArrayDeque<>();
@@ -153,6 +166,11 @@ public final class FecDecoder {
     /** D as last seen in a column FEC packet, or 0 before any (or with row FEC only). */
     public int rows() {
         return rows;
+    }
+
+    /** FEC packets waiting for their row or column to become recoverable. */
+    int pendingCount() {
+        return pending.size();
     }
 
     public long fecPackets() {
@@ -188,6 +206,16 @@ public final class FecDecoder {
             }
         }
         expire();
+    }
+
+    private boolean isPending(Pending candidate) {
+        for (Pending waiting : pending) {
+            if (waiting.base() == candidate.base() && waiting.fec().row() == candidate.fec().row()
+                    && waiting.fec().offset() == candidate.fec().offset() && waiting.fec().na() == candidate.fec().na()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Recovers through one FEC packet if exactly one of its packets is missing; drops it once it is spent. */
@@ -233,6 +261,14 @@ public final class FecDecoder {
             return;
         }
         body.writerIndex(length);
+        // The flags are an XOR too, so corrupt or hostile FEC can claim a CSRC
+        // list, extension or padding the body cannot hold. Delivering such a
+        // packet would throw when its payload is read.
+        if (!RtpPacket.wellFormed(flags, body)) {
+            failed++;
+            body.release();
+            return;
+        }
         RtpPacket packet = new RtpPacket(flags, marker, payloadType, (int) missing & 0xFFFF, timestamp, ssrc, body);
         recovered++;
         remember(missing, new RtpPacket(packet.flags(), packet.marker(), packet.payloadType(),

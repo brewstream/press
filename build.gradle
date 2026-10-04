@@ -1,0 +1,64 @@
+plugins {
+    id 'com.vanniktech.maven.publish' version '0.30.0' apply false
+}
+
+subprojects {
+    apply plugin: 'java-library'
+
+    // io.github.brewstream for the same reason as Roast: Central verifies the
+    // group against the GitHub org, and the Java packages stay org.brewstream.press.
+    group = findProperty('publishGroup') ?: 'io.github.brewstream'
+    version = findProperty('version') != 'unspecified' ? findProperty('version') : '0.1.0-SNAPSHOT'
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+    }
+
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        testImplementation platform('org.junit:junit-bom:5.11.4')
+        testImplementation 'org.junit.jupiter:junit-jupiter'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+        testImplementation 'org.assertj:assertj-core:3.27.7'
+        testImplementation 'org.mockito:mockito-core:5.23.0'
+        testImplementation 'org.mockito:mockito-junit-jupiter:5.23.0'
+    }
+
+    javadoc {
+        // Keep the checks that catch real mistakes (broken {@link}s, malformed
+        // HTML) and drop the missing-tag nag: the packet records document their
+        // wire format in the class javadoc, not in one @param per component.
+        options.addStringOption('Xdoclint:all,-missing', '-quiet')
+    }
+
+    test {
+        useJUnitPlatform {
+            excludeTags 'interop'
+        }
+    }
+
+    tasks.register('licenseCheck', Exec) {
+        description = 'Fails if any Java source is missing the Apache 2.0 header.'
+        group = 'verification'
+        commandLine "${rootDir}/scripts/license-header.sh", '--check'
+    }
+    tasks.named('check') { dependsOn 'licenseCheck' }
+
+    tasks.register('interopTest', Test) {
+        description = 'Runs interop tests against ffmpeg. Skips itself (does not fail) when ffmpeg is absent.'
+        group = 'verification'
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        useJUnitPlatform {
+            includeTags 'interop'
+        }
+        testLogging {
+            events 'passed', 'skipped', 'failed'
+        }
+    }
+}

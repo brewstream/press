@@ -29,6 +29,8 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.util.concurrent.ScheduledFuture;
+import org.brewstream.press.fec.FecDecoder;
+import org.brewstream.press.packet.FecPacket;
 import org.brewstream.press.packet.NtpTime;
 import org.brewstream.press.packet.RtcpPacket;
 import org.brewstream.press.packet.RtpPacket;
@@ -67,7 +69,8 @@ import java.util.logging.Logger;
  * for up to the configured latency, then given up as lost and reported to
  * {@link RtpReceiverListener#onLoss}. Interarrival jitter and the RFC 3550 loss
  * figures are kept, and with RTCP on, the receiver reports them to the sender
- * every five seconds or so.
+ * every five seconds or so. With FEC on, lost packets are rebuilt from SMPTE
+ * 2022-1 row and column FEC before the gap they left is given up on.
  *
  * <p><b>Sources.</b> The first valid packet's SSRC is locked. Packets from any
  * other SSRC are counted and dropped while it is active. Once it has been
@@ -93,6 +96,9 @@ public final class RtpReceiver implements AutoCloseable {
 
     private static final long MPEG_TS_CLOCK_RATE = 90_000;
 
+    /** Media packets of history kept for FEC: two of the largest matrices 2022-1 allows, with room to spare. */
+    private static final int FEC_HISTORY = 512;
+
     /** Attempts at finding a free base port when the configured one is 0. */
     private static final int EPHEMERAL_ATTEMPTS = 32;
 
@@ -105,6 +111,8 @@ public final class RtpReceiver implements AutoCloseable {
 
     private DatagramChannel media;
     private DatagramChannel rtcp;
+    private DatagramChannel fecColumn;
+    private DatagramChannel fecRow;
     private ChannelHandlerContext mediaContext;
     private ScheduledFuture<?> tick;
     private volatile boolean closed;
@@ -114,6 +122,10 @@ public final class RtpReceiver implements AutoCloseable {
     private final SequenceTracker sequence = new SequenceTracker();
     private final JitterEstimator jitter = new JitterEstimator(MPEG_TS_CLOCK_RATE);
     private final ReorderBuffer reorder;
+    private final FecDecoder fec;
+    private boolean warnedLateRecovery;
+    /** Recent recoveries by extended sequence number, to notice the original turning up after all. */
+    private final long[] recoveredSeq = new long[FEC_HISTORY];
     private long sourceSsrc = -1;
     private InetSocketAddress sourceAddress;
     private InetSocketAddress senderRtcpAddress;
@@ -133,6 +145,8 @@ public final class RtpReceiver implements AutoCloseable {
     private long bytesDelivered;
     private long sourceChanges;
     private long senderReports;
+    private long packetsRecovered;
+    private long packetsRecoveredLate;
 
     private RtpReceiver(RtpReceiverConfig config, PressTransport transport) {
         this.config = config;
@@ -149,6 +163,10 @@ public final class RtpReceiver implements AutoCloseable {
                 onLost(firstExtendedSeq, count);
             }
         });
+        java.util.Arrays.fill(recoveredSeq, Long.MIN_VALUE);
+        this.fec = config.fec()
+                ? new FecDecoder(FEC_HISTORY, this::onRecovered, io.netty.buffer.PooledByteBufAllocator.DEFAULT)
+                : null;
     }
 
     /** Binds a receiver on its own event loop group, shut down when the receiver closes. */
@@ -275,6 +293,9 @@ public final class RtpReceiver implements AutoCloseable {
                         tick.cancel(false);
                     }
                     reorder.flush();
+                    if (fec != null) {
+                        fec.reset();
+                    }
                     sendReport(true);
                     finalStats = snapshot();
                 }).sync();
@@ -282,7 +303,7 @@ public final class RtpReceiver implements AutoCloseable {
                 // The group was shut down under us; nothing left to flush on.
             }
         }
-        Channels.closeAndAwaitRelease(rtcp);
+        closeCompanions();
         Channels.closeAndAwaitRelease(media);
         if (transport.shutdownWithOwner()) {
             transport.eventLoopGroup().shutdownGracefully(0, 2, TimeUnit.SECONDS).sync();
@@ -293,7 +314,7 @@ public final class RtpReceiver implements AutoCloseable {
 
     private void open() throws InterruptedException {
         int basePort = config.bindAddress().getPort();
-        if (basePort != 0 || !config.rtcp()) {
+        if (basePort != 0 || !config.rtcp() && !config.fec()) {
             bindAt(basePort);
         } else {
             bindEphemeral();
@@ -304,31 +325,49 @@ public final class RtpReceiver implements AutoCloseable {
         tick = loop.scheduleAtFixedRate(this::onTick, tickNanos, tickNanos, TimeUnit.NANOSECONDS);
     }
 
-    /** Port 0 with RTCP: find a base P where P+1 is free too. */
+    /** Port 0 with RTCP or FEC: find a base P where the ports above it are free too. */
     private void bindEphemeral() throws InterruptedException {
         for (int attempt = 0; attempt < EPHEMERAL_ATTEMPTS; attempt++) {
             media = bindChannel(0, new MediaHandler());
             int port = media.localAddress().getPort();
-            if (port < 65535) {
+            if (port <= 65531) {
                 try {
-                    rtcp = bindChannel(port + 1, new RtcpHandler());
+                    bindCompanions(port);
                     return;
                 } catch (ChannelBindException e) {
-                    // P+1 is taken; try another P.
+                    // One of the ports above is taken; try another P.
                 }
             }
+            closeCompanions();
             Channels.closeAndAwaitRelease(media);
             media = null;
         }
-        throw new IllegalStateException("no free base port with a free RTCP port above it after "
+        throw new IllegalStateException("no free base port with free RTCP and FEC ports above it after "
                 + EPHEMERAL_ATTEMPTS + " attempts");
     }
 
     private void bindAt(int basePort) throws InterruptedException {
         media = bindChannel(basePort, new MediaHandler());
+        bindCompanions(media.localAddress().getPort());
+    }
+
+    private void bindCompanions(int basePort) throws InterruptedException {
         if (config.rtcp()) {
-            rtcp = bindChannel(media.localAddress().getPort() + 1, new RtcpHandler());
+            rtcp = bindChannel(basePort + 1, new RtcpHandler());
         }
+        if (config.fec()) {
+            fecColumn = bindChannel(basePort + 2, new FecHandler());
+            fecRow = bindChannel(basePort + 4, new FecHandler());
+        }
+    }
+
+    private void closeCompanions() throws InterruptedException {
+        Channels.closeAndAwaitRelease(rtcp);
+        Channels.closeAndAwaitRelease(fecColumn);
+        Channels.closeAndAwaitRelease(fecRow);
+        rtcp = null;
+        fecColumn = null;
+        fecRow = null;
     }
 
     private DatagramChannel bindChannel(int port, ChannelInboundHandlerAdapter handler) throws InterruptedException {
@@ -428,17 +467,30 @@ public final class RtpReceiver implements AutoCloseable {
         if (sequence.restarted()) {
             reorder.flush();
             reorder.reset();
+            if (fec != null) {
+                fec.reset();
+            }
             sourceChanges++;
             long ssrc = sourceSsrc;
             notifyListeners(l -> l.onSourceChanged(this, ssrc, ssrc, sender));
         }
         packetsReceived++;
         jitter.update(now, packet.timestamp());
+        if (fec != null) {
+            fec.onMedia(extended, packet); // keeps its own reference
+        }
 
         switch (reorder.offer(extended, packet, now)) {
             case ACCEPTED -> { }
             case DUPLICATE -> {
-                packetsDuplicate++;
+                int slot = (int) extended & (FEC_HISTORY - 1);
+                if (recoveredSeq[slot] == extended) {
+                    // FEC got here first, from another socket; the packet was never lost.
+                    recoveredSeq[slot] = Long.MIN_VALUE;
+                    packetsRecovered--;
+                } else {
+                    packetsDuplicate++;
+                }
                 packet.body().release();
             }
             case LATE -> {
@@ -453,6 +505,9 @@ public final class RtpReceiver implements AutoCloseable {
         if (previous != -1) {
             reorder.flush();
             reorder.reset();
+        }
+        if (fec != null) {
+            fec.reset();
         }
         sequence.reset();
         jitter.reset();
@@ -481,6 +536,55 @@ public final class RtpReceiver implements AutoCloseable {
     private void onLost(long firstExtendedSeq, int count) {
         packetsLost += count;
         notifyListeners(l -> l.onLoss(this, firstExtendedSeq, count));
+    }
+
+    private void onRecovered(long extendedSeq, RtpPacket packet) {
+        packetsRecovered++;
+        switch (reorder.offer(extendedSeq, packet, System.nanoTime())) {
+            case ACCEPTED -> {
+                recoveredSeq[(int) extendedSeq & (FEC_HISTORY - 1)] = extendedSeq;
+                notifyListeners(l -> l.onRecovered(this, extendedSeq));
+            }
+            case DUPLICATE -> packet.body().release();
+            case LATE -> {
+                packetsRecoveredLate++;
+                packet.body().release();
+                if (!warnedLateRecovery) {
+                    warnedLateRecovery = true;
+                    LOG.warning("FEC recovered a packet after delivery had given up on it; latency "
+                            + config.latency().toMillis() + " ms is shorter than the FEC needs ("
+                            + fec.columns() + "x" + fec.rows() + " matrix). Raise it to about two matrices of packets.");
+                }
+            }
+        }
+    }
+
+    private final class FecHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            if (!(msg instanceof DatagramPacket datagram)) {
+                ctx.fireChannelRead(msg);
+                return;
+            }
+            try {
+                FecPacket packet = FecPacket.decode(datagram.content());
+                if (packet == null) {
+                    return;
+                }
+                if (sourceSsrc == -1) {
+                    packet.payload().release();
+                    return;
+                }
+                fec.onFec(packet);
+            } finally {
+                datagram.release();
+            }
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            LOG.log(Level.WARNING, "FEC socket error", cause);
+        }
     }
 
     private void onTick() {
@@ -581,7 +685,8 @@ public final class RtpReceiver implements AutoCloseable {
         return new ReceiverStats(sourceSsrc, sourceAddress, packetsReceived, packetsDelivered, packetsLost,
                 packetsDuplicate, packetsLate, packetsInvalid, packetsForeign, bytesDelivered,
                 sourceSsrc == -1 ? 0 : sequence.cumulativeLost(), jitter.jitterMicros(), sourceChanges,
-                senderReports);
+                senderReports, fec == null ? 0 : fec.fecPackets(), packetsRecovered, packetsRecoveredLate,
+                fec == null ? 0 : fec.columns(), fec == null ? 0 : fec.rows());
     }
 
     private void notifyListeners(Consumer<RtpReceiverListener> event) {

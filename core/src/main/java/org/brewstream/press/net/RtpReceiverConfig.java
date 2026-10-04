@@ -25,12 +25,13 @@ import java.util.Objects;
 /**
  * Where and how a {@link RtpReceiver} listens.
  *
- * <p>The ports follow the usual convention: media on the base port P and RTCP
- * on P+1. With base port 0 the receiver picks a free base for which every port
- * it needs is free, so an ephemeral receiver can still have RTCP.
+ * <p>The ports follow the convention SMPTE 2022-1 and every common sender use:
+ * media on the base port P, RTCP on P+1, column FEC on P+2 and row FEC on P+4.
+ * With base port 0 the receiver picks a free base for which every port it
+ * needs is free, so an ephemeral receiver can still have RTCP and FEC.
  *
  * <pre>{@code
- * RtpReceiverConfig.unicast(5000).withLatency(Duration.ofMillis(300));
+ * RtpReceiverConfig.unicast(5000).withFec(true).withLatency(Duration.ofMillis(400));
  * RtpReceiverConfig.multicast(InetAddress.getByName("239.1.1.1"), 5000).withInterface(eth0);
  * }</pre>
  *
@@ -43,8 +44,12 @@ import java.util.Objects;
  *                         this sender. {@code null} for any-source
  * @param latency          how long a gap in the sequence is waited on before the packets
  *                         after it are delivered anyway. This bounds how much reordering is
- *                         repaired, and is the delay every packet behind a loss pays
+ *                         repaired, and is the delay every packet behind a loss pays. With FEC
+ *                         it must also cover the time FEC takes to arrive: about two matrices
+ *                         of packets, because senders spread a matrix's column FEC packets
+ *                         over the next one
  * @param rtcp             listen on P+1 and send receiver reports to the sender
+ * @param fec              listen on P+2 and P+4 for SMPTE 2022-1 column and row FEC
  * @param receiveBufferBytes the socket receive buffer to ask the OS for. Contribution
  *                         streams arrive in bursts that overrun small default buffers
  */
@@ -55,6 +60,7 @@ public record RtpReceiverConfig(
         InetAddress sourceFilter,
         Duration latency,
         boolean rtcp,
+        boolean fec,
         int receiveBufferBytes) {
 
     /** A short wait that absorbs reordering on a clean network. */
@@ -75,8 +81,10 @@ public record RtpReceiverConfig(
         if (sourceFilter != null && multicastGroup == null) {
             throw new IllegalArgumentException("a source filter only applies to multicast");
         }
-        if (rtcp && bindAddress.getPort() == 65535) {
-            throw new IllegalArgumentException("base port 65535 leaves no room for RTCP on the port above it");
+        int highestOffset = fec ? 4 : rtcp ? 1 : 0;
+        if (bindAddress.getPort() != 0 && bindAddress.getPort() + highestOffset > 65535) {
+            throw new IllegalArgumentException("base port " + bindAddress.getPort()
+                    + " leaves no room for the RTCP and FEC ports above it");
         }
         if (receiveBufferBytes <= 0) {
             throw new IllegalArgumentException("receiveBufferBytes must be positive");
@@ -90,38 +98,43 @@ public record RtpReceiverConfig(
 
     /** Unicast on one local address and base port. */
     public static RtpReceiverConfig unicast(InetSocketAddress bindAddress) {
-        return new RtpReceiverConfig(bindAddress, null, null, null, DEFAULT_LATENCY, true,
+        return new RtpReceiverConfig(bindAddress, null, null, null, DEFAULT_LATENCY, true, false,
                 DEFAULT_RECEIVE_BUFFER_BYTES);
     }
 
     /** Any-source multicast on a group and base port. */
     public static RtpReceiverConfig multicast(InetAddress group, int port) {
-        return new RtpReceiverConfig(new InetSocketAddress(port), group, null, null, DEFAULT_LATENCY, true,
+        return new RtpReceiverConfig(new InetSocketAddress(port), group, null, null, DEFAULT_LATENCY, true, false,
                 DEFAULT_RECEIVE_BUFFER_BYTES);
     }
 
     public RtpReceiverConfig withInterface(NetworkInterface networkInterface) {
-        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp,
+        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp, fec,
                 receiveBufferBytes);
     }
 
     public RtpReceiverConfig withSource(InetAddress sourceFilter) {
-        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp,
+        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp, fec,
                 receiveBufferBytes);
     }
 
     public RtpReceiverConfig withLatency(Duration latency) {
-        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp,
+        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp, fec,
                 receiveBufferBytes);
     }
 
     public RtpReceiverConfig withRtcp(boolean rtcp) {
-        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp,
+        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp, fec,
+                receiveBufferBytes);
+    }
+
+    public RtpReceiverConfig withFec(boolean fec) {
+        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp, fec,
                 receiveBufferBytes);
     }
 
     public RtpReceiverConfig withReceiveBufferBytes(int receiveBufferBytes) {
-        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp,
+        return new RtpReceiverConfig(bindAddress, multicastGroup, networkInterface, sourceFilter, latency, rtcp, fec,
                 receiveBufferBytes);
     }
 }

@@ -53,7 +53,7 @@ final class Ffmpeg {
 
     /**
      * A transport stream of MPEG-2 video and MP2 audio, encoders every ffmpeg
-     * build carries. Made once per build directory and reused.
+     * build carries, at about 3 Mbps. Made once per build directory and reused.
      */
     static Path fixture() throws IOException, InterruptedException {
         Path fixture = Path.of("build", "interop", "fixture.ts");
@@ -63,10 +63,14 @@ final class Ffmpeg {
         Files.createDirectories(fixture.getParent());
         Path partial = fixture.resolveSibling("fixture.ts.partial");
         run(List.of(binary(), "-y", "-v", "error",
-                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25",
+                "-f", "lavfi", "-i", "testsrc=size=640x360:rate=25,noise=alls=40:allf=t",
                 "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
                 "-t", String.valueOf(FIXTURE_SECONDS),
-                "-c:v", "mpeg2video", "-b:v", "1500k", "-g", "25",
+                // Noise keeps a test pattern from compressing to nothing: about 3 Mbps,
+                // 300 packets a second, so an FEC matrix lasts tens of milliseconds as
+                // it would on a real contribution feed.
+                "-c:v", "mpeg2video", "-b:v", "3000k", "-minrate", "3000k", "-maxrate", "3000k",
+                "-bufsize", "1500k", "-g", "25",
                 "-c:a", "mp2", "-b:a", "128k",
                 "-f", "mpegts", partial.toString()), 60);
         Files.move(partial, fixture);

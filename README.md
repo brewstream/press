@@ -4,15 +4,16 @@ Pure-Java RTP transport for MPEG-TS. Part of **BrewStream**: Press is the RTP
 leg, as [Roast](https://github.com/brewstream/roast) is the SRT leg.
 
 Press carries a transport stream over RTP the way broadcast contribution links
-do: RFC 3550 RTP and RTCP, the RFC 2250 / SMPTE 2022-2 MPEG-TS payload, unicast
-or multicast. A receiver puts packets back in order, decides when a missing one
-is lost, keeps the RFC 3550 statistics, and reports them to the sender over
+do: RFC 3550 RTP and RTCP, the RFC 2250 / SMPTE 2022-2 MPEG-TS payload, SMPTE
+2022-1 forward error correction, unicast or multicast. A receiver puts packets
+back in order, rebuilds lost ones from FEC, decides when a missing one is gone
+for good, keeps the RFC 3550 statistics, and reports them to the sender over
 RTCP. Its data path is a Netty pipeline, so a stream received by Press is
 inspected with [Grind](https://github.com/brewstream/grind) exactly as an SRT
 stream received by Roast is.
 
-**Status:** in development, not yet released. The receive path is done. SMPTE
-2022-1 FEC and the sender are next; see [Roadmap](#roadmap).
+**Status:** in development, not yet released. The receive path, including
+SMPTE 2022-1 FEC, is done. The sender is next; see [Roadmap](#roadmap).
 
 ## Requirements
 
@@ -71,18 +72,44 @@ RtpReceiverConfig.multicast(InetAddress.getByName("239.1.1.1"), 5000)
   (randomised by ±50%, §6.3.1) to the address its sender reports come from, and
   BYE on close. Sender reports are surfaced to listeners.
 
+### Forward error correction
+
+```java
+RtpReceiverConfig.unicast(5000).withFec(true).withLatency(Duration.ofMillis(400));
+```
+
+With FEC on, the receiver also listens on P+2 for column FEC and P+4 for row
+FEC (SMPTE 2022-1, the Pro-MPEG CoP #3 layout every common sender uses). It
+needs no matrix settings: each FEC packet says what it protects, and the L×D
+matrix in use is reported in `stats()`.
+
+A missing packet is rebuilt as soon as one row or column it belongs to has
+nothing else missing, and each recovery is re-checked against the other
+dimension. So a matrix survives a burst of up to L consecutive losses
+(through the columns) together with scattered single losses (through the
+rows). Against ffmpeg's FEC, a link dropping 7.7% of packets in that pattern
+delivered every one of them.
+
+**Latency has to cover the FEC.** Column FEC for a matrix arrives spread over
+the following matrix, so a gap can only be repaired that long after it opened.
+Set `latency` to about two matrices of packets. For a 5×5 matrix at 3 Mbps
+(about 300 packets a second), that is roughly 170 ms, so 300-400 ms is
+comfortable. A recovery that arrives after delivery has given up is counted in
+`packetsRecoveredLate`, and the first one logs a warning saying so.
+
 ### Configuration
 
 | Setting | Default | |
 |---|---|---|
 | `latency` | 120 ms | How long a gap is waited on. Every packet behind a loss pays up to this much delay. |
 | `rtcp` | on | RTCP on base port + 1. |
+| `fec` | off | SMPTE 2022-1 column FEC on base port + 2, row FEC on + 4. |
 | `receiveBufferBytes` | 4 MiB | The socket buffer to ask the OS for. Contribution streams arrive in bursts that overrun small defaults. |
 | `networkInterface` | first up, multicast-capable, non-loopback | Multicast only. |
 | `sourceFilter` | none | Multicast only: SSM source. |
 
-Base port 0 picks a free port P for which P+1 is free too, so an ephemeral
-receiver still gets RTCP.
+Base port 0 picks a free port P for which the RTCP and FEC ports above it are
+free too.
 
 ### Statistics
 
@@ -93,6 +120,11 @@ after close. Two loss figures, because they answer different questions:
   receiver reports carry.
 - `packetsLost` is what the application never got: packets given up on at
   delivery. With FEC, the first can be positive while the second stays zero.
+
+With FEC: `packetsRecovered` counts packets rebuilt and never received.
+FEC can overtake the media it protects, and a packet rebuilt that way and then
+received is not counted. There is also `packetsRecoveredLate` (see above), and
+the matrix in use (`fecColumns`, `fecRows`).
 
 Also: delivered, duplicate, late, invalid and foreign-SSRC packet counts,
 jitter in microseconds, source changes, and sender reports received.
@@ -119,11 +151,13 @@ Tested against ffmpeg (`./gradlew interopTest`, skipped when ffmpeg is absent):
 | Direction | Peer | Checked |
 |---|---|---|
 | ffmpeg → Press | `ffmpeg -f rtp_mpegts` | no loss, zero TS continuity errors (Grind), every frame decodes, ffmpeg's RTCP SRs understood |
+| ffmpeg → lossy link → Press | `-fec prompeg=l=5:d=5`, 7.7% of media dropped | every dropped packet recovered, zero continuity errors, every frame decodes. Without FEC the same link causes continuity errors |
+| Press encoder vs ffmpeg | the same media through both | every FEC packet identical in every recovery field and payload byte |
 
 ## Roadmap
 
-1. ~~Receive path: RTP, RTCP, reordering, statistics~~ (this release)
-2. SMPTE 2022-1 FEC recovery, column and row
+1. ~~Receive path: RTP, RTCP, reordering, statistics~~
+2. ~~SMPTE 2022-1 FEC recovery, column and row~~
 3. Sender with optional FEC, and fan-out to many destinations
 4. Later: RIST simple profile (RTP plus NACK retransmission)
 

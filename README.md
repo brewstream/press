@@ -8,9 +8,7 @@ do: RFC 3550 RTP and RTCP, the RFC 2250 / SMPTE 2022-2 MPEG-TS payload, SMPTE
 2022-1 forward error correction, unicast or multicast. A receiver puts packets
 back in order, rebuilds lost ones from FEC, decides when a missing one is gone
 for good, keeps the RFC 3550 statistics, and reports them to the sender over
-RTCP. A sender packs a transport stream into RTP, with FEC if asked, and a
-fan-out handler relays one stream to any number of destinations that come and
-go while it runs. Its data path is a Netty pipeline, so a stream received by Press is
+RTCP. A sender packs a transport stream into RTP, with FEC if asked. Its data path is a Netty pipeline, so a stream received by Press is
 inspected with [Grind](https://github.com/brewstream/grind) exactly as an SRT
 stream received by Roast is.
 
@@ -163,25 +161,24 @@ receiver's loss and jitter, and the round-trip time (RFC 3550 §6.4.1).
 | `withTtl`, `withInterface` | system defaults | Multicast destinations. |
 | `rtcp` | on | |
 
-## Relaying: fan-out
+## Composing with other transports
+
+Press is one transport leg, as Roast is. Topology, meaning which inputs go to which
+outputs, fan-out to several protocols, and failover between sources, belongs to
+BrewStream, which composes the legs. Press provides the hops: a receiver's
+pipeline delivers in-order payloads, and anything that writes them on works,
+including an `RtpSender` or a Roast `SrtConnection`:
 
 ```java
-FanOut fanOut = new FanOut();
-RtpReceiver.bind(RtpReceiverConfig.unicast(5000).withFec(true), pipeline -> pipeline.addLast(fanOut));
-
-fanOut.add("studio-b", RtpSender.connect(RtpSenderConfig.to(studioB))::write);
-fanOut.add("archive", srtConnection::write);   // a Roast SRT connection, the same way
-fanOut.remove("studio-b");
+RtpSender out = RtpSender.connect(RtpSenderConfig.to(destination));
+RtpReceiver.bind(RtpReceiverConfig.unicast(5000), pipeline -> pipeline.addLast(
+        new SimpleChannelInboundHandler<ByteBuf>(false) {
+            @Override
+            protected void channelRead0(ChannelHandlerContext ctx, ByteBuf payload) {
+                out.write(payload);   // takes ownership
+            }
+        }));
 ```
-
-`FanOut` is a pipeline handler that hands every payload to every destination,
-and then passes it on down the pipeline, so an analyzer after it still sees the
-stream. A destination is any `Consumer<ByteBuf>` that takes ownership:
-`RtpSender::write`, Roast's `SrtConnection::write`, or your own. Each gets its
-own reference to the same bytes, with no copying. Destinations can be added
-and removed while the stream runs; a new one starts with the next payload. It
-works on a Roast connection's pipeline as well, which makes SRT-to-RTP a
-one-liner in either direction.
 
 ## Threading and resources
 
@@ -217,7 +214,7 @@ sender's round-trip time is verified Press-to-Press only.
 
 1. ~~Receive path: RTP, RTCP, reordering, statistics~~
 2. ~~SMPTE 2022-1 FEC recovery, column and row~~
-3. ~~Sender with optional FEC, and fan-out to many destinations~~
+3. ~~Sender with optional FEC~~
 4. Next: RIST simple profile (RTP plus NACK retransmission), and raw UDP
    transport streams without RTP, which many contribution links still use.
 

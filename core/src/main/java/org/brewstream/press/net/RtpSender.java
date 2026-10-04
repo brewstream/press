@@ -95,7 +95,6 @@ public final class RtpSender implements AutoCloseable {
     private volatile boolean closed;
     private volatile SenderStats finalStats;
 
-    // Owned by the event loop.
     private final FecEncoder fec;
     private ByteBuf pending;
     private int sequence = ThreadLocalRandom.current().nextInt(1 << 16);

@@ -520,8 +520,6 @@ public final class RtpReceiver implements AutoCloseable {
             packet.body().release();
             return;
         }
-        // The payload slice shares the body's reference count, so whoever
-        // consumes it releases the body.
         mediaContext.fireChannelRead(payload);
         mediaContext.fireChannelReadComplete();
     }
@@ -672,7 +670,6 @@ public final class RtpReceiver implements AutoCloseable {
         return (long) (RTCP_INTERVAL_NANOS * (0.5 + ThreadLocalRandom.current().nextDouble()));
     }
 
-    // --- misc ----------------------------------------------------------------
 
     private ReceiverStats snapshot() {
         return new ReceiverStats(sourceSsrc, sourceAddress, packetsReceived, packetsDelivered, packetsLost,

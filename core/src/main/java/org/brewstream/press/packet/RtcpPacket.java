@@ -149,7 +149,6 @@ public sealed interface RtcpPacket {
                 out.writeByte(SDES_CNAME);
                 out.writeByte(length);
                 out.writeBytes(name, 0, length);
-                // The item list ends with a zero byte, then pads to a 32-bit boundary (§6.5).
                 int itemBytes = 2 + length + 1;
                 out.writeZero(1 + (4 - itemBytes % 4) % 4);
             }

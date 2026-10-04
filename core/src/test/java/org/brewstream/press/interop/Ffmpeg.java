@@ -97,6 +97,17 @@ final class Ffmpeg {
             return Files.readString(log);
         }
 
+        /** Asks ffmpeg to stop as if 'q' were typed, so it finishes its output file properly. */
+        boolean quit(long seconds) throws IOException, InterruptedException {
+            try {
+                process.getOutputStream().write('q');
+                process.getOutputStream().flush();
+            } catch (IOException e) {
+                // already gone
+            }
+            return process.waitFor(seconds, TimeUnit.SECONDS);
+        }
+
         @Override
         public void close() {
             process.destroyForcibly();
@@ -114,6 +125,16 @@ final class Ffmpeg {
         // Some ffprobe versions print a trailing separator after the field ("150,").
         String last = out.lines().reduce((a, b) -> b).orElse("0").replaceAll("[^0-9]", "");
         return last.isEmpty() ? 0 : Integer.parseInt(last);
+    }
+
+    /** What ffmpeg reports while decoding a file completely: empty for a clean stream. */
+    static String decodeErrors(Path file) throws IOException, InterruptedException {
+        Process decode = new ProcessBuilder(binary(), "-v", "error", "-i", file.toString(), "-f", "null", "-")
+                .redirectErrorStream(true)
+                .start();
+        String out = new String(decode.getInputStream().readAllBytes()).trim();
+        decode.waitFor(60, TimeUnit.SECONDS);
+        return out;
     }
 
     /** Runs Grind over a transport stream held in memory. */

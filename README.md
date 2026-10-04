@@ -8,12 +8,14 @@ do: RFC 3550 RTP and RTCP, the RFC 2250 / SMPTE 2022-2 MPEG-TS payload, SMPTE
 2022-1 forward error correction, unicast or multicast. A receiver puts packets
 back in order, rebuilds lost ones from FEC, decides when a missing one is gone
 for good, keeps the RFC 3550 statistics, and reports them to the sender over
-RTCP. Its data path is a Netty pipeline, so a stream received by Press is
+RTCP. A sender packs a transport stream into RTP, with FEC if asked, and a
+fan-out handler relays one stream to any number of destinations that come and
+go while it runs. Its data path is a Netty pipeline, so a stream received by Press is
 inspected with [Grind](https://github.com/brewstream/grind) exactly as an SRT
 stream received by Roast is.
 
-**Status:** in development, not yet released. The receive path, including
-SMPTE 2022-1 FEC, is done. The sender is next; see [Roadmap](#roadmap).
+**Status:** feature-complete for its first release, not yet released. See
+[Roadmap](#roadmap) for what comes after.
 
 ## Requirements
 
@@ -129,20 +131,73 @@ the matrix in use (`fecColumns`, `fecRows`).
 Also: delivered, duplicate, late, invalid and foreign-SSRC packet counts,
 jitter in microseconds, source changes, and sender reports received.
 
-### Threading and resources
+## Sending
 
-A receiver's sockets share one event loop and its state lives there,
-unsynchronised. Listeners run on that loop, so they must return quickly. By
-default each receiver has its own single-thread event loop group, shut down when
-it closes. To run many receivers, or to share with Roast, lend a group:
+```java
+RtpSender sender = RtpSender.connect(RtpSenderConfig.to(new InetSocketAddress("10.0.0.9", 5000))
+        .withFec(5, 5));
+sender.write(tsBytes);   // any amount, from any thread; takes ownership
+```
+
+`write` packs transport stream bytes into RTP packets of seven 188-byte TS
+packets (1316 bytes, the most that fits a 1500-byte MTU). A packet goes out as
+soon as it is full; `flush()` sends a partial one. Sequence numbers start at
+random, and timestamps are the 90 kHz send time, as RFC 2250 specifies.
+
+**Pacing is the caller's.** A live source (a capture card, a Roast connection, a
+Press receiver) produces a live-paced stream. A file written as fast as it can
+be read goes out that fast.
+
+The sender sends from a local port pair Q/Q+1 and sends to the destination's
+P (media), P+1 (sender reports, every 5 s ±50%, and BYE on close), and with FEC
+P+2 (column) and P+4 (row). Column FEC packets go out spread over the next
+matrix, as ffmpeg sends them, not in a burst that a bursty link would lose
+together. Receiver reports arriving at Q+1 update `stats()` with the
+receiver's loss and jitter, and the round-trip time (RFC 3550 §6.4.1).
+
+| Setting | Default | |
+|---|---|---|
+| `withFec(L, D)` | none | SMPTE 2022-1 limits: L 1-20, D 4-20, L×D at most 100. |
+| `tsPacketsPerDatagram` | 7 | 1 to 7. |
+| `payloadType` | 33 | MP2T (RFC 3551). |
+| `withTtl`, `withInterface` | system defaults | Multicast destinations. |
+| `rtcp` | on | |
+
+## Relaying: fan-out
+
+```java
+FanOut fanOut = new FanOut();
+RtpReceiver.bind(RtpReceiverConfig.unicast(5000).withFec(true), pipeline -> pipeline.addLast(fanOut));
+
+fanOut.add("studio-b", RtpSender.connect(RtpSenderConfig.to(studioB))::write);
+fanOut.add("archive", srtConnection::write);   // a Roast SRT connection, the same way
+fanOut.remove("studio-b");
+```
+
+`FanOut` is a pipeline handler that hands every payload to every destination,
+and then passes it on down the pipeline, so an analyzer after it still sees the
+stream. A destination is any `Consumer<ByteBuf>` that takes ownership:
+`RtpSender::write`, Roast's `SrtConnection::write`, or your own. Each gets its
+own reference to the same bytes, with no copying. Destinations can be added
+and removed while the stream runs; a new one starts with the next payload. It
+works on a Roast connection's pipeline as well, which makes SRT-to-RTP a
+one-liner in either direction.
+
+## Threading and resources
+
+Each receiver's or sender's sockets share one event loop, and its state lives
+there, unsynchronised. Listeners run on that loop, so they must return quickly.
+By default each has its own single-thread event loop group, shut down when it
+closes. To run many, or to share with Roast, lend a group:
 
 ```java
 PressTransport transport = PressTransport.shared(group, NioDatagramChannel.class);
 RtpReceiver.bind(config, transport);
+RtpSender.connect(senderConfig, transport);
 ```
 
-`close()` delivers whatever is waiting behind a gap, sends BYE, and returns once
-the ports can be bound again.
+`close()` sends what is pending, says BYE, and returns once the ports can be
+bound again.
 
 ## Interoperability
 
@@ -153,13 +208,18 @@ Tested against ffmpeg (`./gradlew interopTest`, skipped when ffmpeg is absent):
 | ffmpeg → Press | `ffmpeg -f rtp_mpegts` | no loss, zero TS continuity errors (Grind), every frame decodes, ffmpeg's RTCP SRs understood |
 | ffmpeg → lossy link → Press | `-fec prompeg=l=5:d=5`, 7.7% of media dropped | every dropped packet recovered, zero continuity errors, every frame decodes. Without FEC the same link causes continuity errors |
 | Press encoder vs ffmpeg | the same media through both | every FEC packet identical in every recovery field and payload byte |
+| Press → ffmpeg | `ffmpeg -i rtp://...` (PT 33, no SDP) | decodes with no errors and no continuity errors; 124 of 150 frames recorded, against 123 when ffmpeg's own sender feeds it the same way (ffmpeg drops what it uses for probing) |
+
+ffmpeg's RTP input sent no receiver reports to the sender in these runs, so the
+sender's round-trip time is verified Press-to-Press only.
 
 ## Roadmap
 
 1. ~~Receive path: RTP, RTCP, reordering, statistics~~
 2. ~~SMPTE 2022-1 FEC recovery, column and row~~
-3. Sender with optional FEC, and fan-out to many destinations
-4. Later: RIST simple profile (RTP plus NACK retransmission)
+3. ~~Sender with optional FEC, and fan-out to many destinations~~
+4. Next: RIST simple profile (RTP plus NACK retransmission), and raw UDP
+   transport streams without RTP, which many contribution links still use.
 
 Not planned: RTP payload formats for elementary streams (H.264 RFC 6184 and so
 on), SRTP, and SMPTE ST 2110. Press carries transport streams.

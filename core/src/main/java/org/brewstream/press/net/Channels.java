@@ -32,6 +32,13 @@ final class Channels {
     private Channels() {
     }
 
+    /** A port that could not be bound, kept distinct so an ephemeral port search can retry. */
+    static final class BindFailed extends IllegalStateException {
+        BindFailed(java.net.InetSocketAddress address, Throwable cause) {
+            super("could not bind " + address, cause);
+        }
+    }
+
     /**
      * Closes {@code channel} and returns once its port can be bound again.
      *

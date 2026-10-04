@@ -37,7 +37,8 @@ import java.net.InetSocketAddress;
  * @param packetsLate      packets that arrived after they had been given up on
  * @param packetsInvalid   datagrams that failed RTP header checks, or whose sequence number
  *                         was too far out of range to place
- * @param packetsForeign   packets from another SSRC while this source was active
+ * @param packetsForeign   packets from another SSRC while this source was active, and FEC
+ *                         packets from any host but the source's
  * @param bytesDelivered   payload bytes handed to the pipeline
  * @param networkLost      RFC 3550 cumulative loss: expected minus received. Duplicates can
  *                         make it negative

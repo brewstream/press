@@ -277,8 +277,14 @@ public final class RtpReceiver implements AutoCloseable {
     }
 
     /**
-     * Stops receiving. Packets still waiting behind a gap are delivered first, a
-     * BYE is sent if RTCP is on, and the ports are free when this returns.
+     * Stops receiving. Packets still waiting behind a gap are delivered first and
+     * a BYE is sent if RTCP is on.
+     *
+     * <p>Called from any other thread, this returns once the ports can be bound
+     * again. Called on the receiver's own event loop, from a listener or a
+     * handler, it cannot wait for that without blocking the loop it would be
+     * waiting on, so the sockets close as soon as the loop is free and this
+     * returns at once.
      */
     @Override
     public void close() throws InterruptedException {
@@ -286,19 +292,21 @@ public final class RtpReceiver implements AutoCloseable {
             return;
         }
         closed = true;
+        if (loop.inEventLoop()) {
+            finishOnLoop();
+            for (Channel channel : new Channel[]{rtcp, fecColumn, fecRow, media}) {
+                if (channel != null) {
+                    channel.close();
+                }
+            }
+            if (transport.shutdownWithOwner()) {
+                transport.eventLoopGroup().shutdownGracefully(0, 2, TimeUnit.SECONDS);
+            }
+            return;
+        }
         if (!loop.isShuttingDown()) {
             try {
-                loop.submit(() -> {
-                    if (tick != null) {
-                        tick.cancel(false);
-                    }
-                    reorder.flush();
-                    if (fec != null) {
-                        fec.reset();
-                    }
-                    sendReport(true);
-                    finalStats = snapshot();
-                }).sync();
+                loop.submit(this::finishOnLoop).sync();
             } catch (java.util.concurrent.RejectedExecutionException e) {
                 // The group was shut down under us; nothing left to flush on.
             }
@@ -308,6 +316,19 @@ public final class RtpReceiver implements AutoCloseable {
         if (transport.shutdownWithOwner()) {
             transport.eventLoopGroup().shutdownGracefully(0, 2, TimeUnit.SECONDS).sync();
         }
+    }
+
+    /** The part of closing that touches receiver state, so runs on the loop. */
+    private void finishOnLoop() {
+        if (tick != null) {
+            tick.cancel(false);
+        }
+        reorder.flush();
+        if (fec != null) {
+            fec.reset();
+        }
+        sendReport(true);
+        finalStats = snapshot();
     }
 
     // --- binding -------------------------------------------------------------
@@ -562,7 +583,11 @@ public final class RtpReceiver implements AutoCloseable {
                 if (packet == null) {
                     return;
                 }
-                if (sourceSsrc == -1) {
+                // FEC carries no usable SSRC (senders put 0 there), so it is tied to the
+                // media source by address. The port can differ: ffmpeg sends FEC from
+                // other sockets than its media.
+                if (sourceSsrc == -1 || !datagram.sender().getAddress().equals(sourceAddress.getAddress())) {
+                    packetsForeign++;
                     packet.payload().release();
                     return;
                 }
@@ -578,12 +603,20 @@ public final class RtpReceiver implements AutoCloseable {
         }
     }
 
+    /**
+     * Netty stops rescheduling a periodic task that throws, which would leave gaps
+     * that never time out and reports that never go. So nothing escapes from here.
+     */
     private void onTick() {
-        long now = System.nanoTime();
-        reorder.drain(now);
-        if (now - nextReportNanos >= 0) {
-            sendReport(false);
-            nextReportNanos = now + reportInterval();
+        try {
+            long now = System.nanoTime();
+            reorder.drain(now);
+            if (now - nextReportNanos >= 0) {
+                sendReport(false);
+                nextReportNanos = now + reportInterval();
+            }
+        } catch (RuntimeException e) {
+            LOG.log(Level.WARNING, "receiver tick failed; continuing", e);
         }
     }
 

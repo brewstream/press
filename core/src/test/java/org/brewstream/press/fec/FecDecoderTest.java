@@ -116,6 +116,71 @@ class FecDecoderTest {
     }
 
     /**
+     * The flags of a rebuilt packet are an XOR too. Here they claim a header
+     * extension (X) while the rebuilt body is one byte, which reading its payload
+     * would overrun. Such a packet is dropped and counted, not delivered.
+     */
+    @Test
+    void dropsARebuiltPacketWhoseHeaderItsBodyCannotHold() {
+        RtpPacket known = media(0, 188);
+        decoder.onMedia(0, known);
+
+        // Protects 0 and 1. Lengths 188 ^ 189 rebuild a 1-byte body for 1, flags 0x10.
+        decoder.onFec(new FecPacket(1, 0, 0x10, false, 0, 188 ^ 1, 0, 0, true, 1, 2,
+                io.netty.buffer.Unpooled.buffer(188).writeZero(188)));
+
+        assertThat(recovered).isEmpty();
+        assertThat(decoder.failed()).isEqualTo(1);
+    }
+
+    @Test
+    void keepsOneCopyOfARepeatedFecPacket() {
+        decoder.onMedia(0, media(0, 188));
+
+        for (int i = 0; i < 1000; i++) {
+            decoder.onFec(unresolvableRow(1));
+        }
+
+        assertThat(decoder.pendingCount()).isEqualTo(1);
+    }
+
+    /** Expiry follows media; with media stalled, distinct FEC must still not pile up. */
+    @Test
+    void boundsWhatWaitsWhileMediaIsStalled() {
+        decoder.onMedia(0, media(0, 188));
+
+        int distinct = 0;
+        for (int count = 2; count <= 5; count++) {
+            for (int base = 1; base <= 200; base++) {
+                decoder.onFec(unresolvableRow(base, count));
+                distinct++;
+            }
+        }
+
+        assertThat(distinct).isGreaterThan(FecDecoder.MAX_PENDING);
+        assertThat(decoder.pendingCount()).isEqualTo(FecDecoder.MAX_PENDING);
+    }
+
+    @Test
+    void ignoresFecForSequenceNumbersFarBeyondTheStream() {
+        decoder.onMedia(0, media(0, 188));
+
+        decoder.onFec(unresolvableRow(30_000));
+
+        assertThat(decoder.pendingCount()).isZero();
+    }
+
+    /** A row FEC packet over five packets none of which has arrived, so it can only wait. */
+    private static FecPacket unresolvableRow(int base) {
+        return unresolvableRow(base, 5);
+    }
+
+    private static FecPacket unresolvableRow(int base, int count) {
+        return new FecPacket(1, 0, 0, false, base & 0xFFFF, 188, 33, 0, true, 1, count,
+                io.netty.buffer.Unpooled.buffer(188).writeZero(188));
+    }
+
+    /**
      * Runs two full matrices and a third (so the second's column FEC arrives),
      * in the order a sender emits them: media, with row FEC after each row and
      * column FEC spread through the next matrix.

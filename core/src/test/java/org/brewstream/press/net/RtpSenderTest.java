@@ -197,6 +197,57 @@ class RtpSenderTest {
         }
     }
 
+    /**
+     * RFC 2250 §2: a payload holds whole TS packets. Flushing 200 bytes sends the
+     * one whole packet and keeps the 12 bytes after it, which the next write
+     * completes.
+     */
+    @Test
+    void flushSendsOnlyWholeTsPacketsAndKeepsTheRest() throws Exception {
+        try (DatagramSocket socket = new DatagramSocket(0, LOOPBACK)) {
+            socket.setSoTimeout(5000);
+            sender = RtpSender.connect(RtpSenderConfig.to((InetSocketAddress) socket.getLocalSocketAddress())
+                    .withRtcp(false));
+            byte[] stream = tsBytes(2);
+
+            sender.write(Unpooled.wrappedBuffer(stream, 0, 200));
+            sender.flush();
+            RtpPacket first = receive(socket);
+            sender.write(Unpooled.wrappedBuffer(stream, 200, stream.length - 200));
+            sender.flush();
+            RtpPacket second = receive(socket);
+
+            assertThat(ByteBufUtil.getBytes(first.payload())).isEqualTo(Arrays.copyOfRange(stream, 0, 188));
+            assertThat(ByteBufUtil.getBytes(second.payload())).isEqualTo(Arrays.copyOfRange(stream, 188, 376));
+        }
+    }
+
+    /** close() on the sender's own event loop, as from a listener, must not throw or leave it open. */
+    @Test
+    void closesFromItsOwnEventLoop() throws Exception {
+        io.netty.channel.EventLoopGroup group = new io.netty.channel.MultiThreadIoEventLoopGroup(1,
+                io.netty.channel.nio.NioIoHandler.newFactory());
+        try {
+            RtpSender onLoop = RtpSender.connect(RtpSenderConfig.to(new InetSocketAddress(LOOPBACK, 5000)),
+                    PressTransport.shared(group, io.netty.channel.socket.nio.NioDatagramChannel.class));
+            int port = onLoop.localAddress().getPort();
+
+            group.next().submit(() -> {
+                onLoop.close();
+                return null;
+            }).get(5, TimeUnit.SECONDS);
+
+            assertThat(onLoop.stats()).isNotNull();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!canBind(port) && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertThat(canBind(port)).as("socket closed once the loop was free").isTrue();
+        } finally {
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).sync();
+        }
+    }
+
     @Test
     void refusesFecMatricesOutsideTheStandard() {
         RtpSenderConfig config = RtpSenderConfig.to(new InetSocketAddress(LOOPBACK, 5000));
@@ -253,6 +304,14 @@ class RtpSenderTest {
             bytes[i] = i % 188 == 0 ? 0x47 : (byte) (i * 13 + i / 188);
         }
         return bytes;
+    }
+
+    private static boolean canBind(int port) {
+        try (DatagramSocket socket = new DatagramSocket(port, LOOPBACK)) {
+            return true;
+        } catch (java.io.IOException e) {
+            return false;
+        }
     }
 
     private static RtpPacket receive(DatagramSocket socket) throws Exception {

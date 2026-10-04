@@ -139,7 +139,10 @@ sender.write(tsBytes);   // any amount, from any thread; takes ownership
 
 `write` packs transport stream bytes into RTP packets of seven 188-byte TS
 packets (1316 bytes, the most that fits a 1500-byte MTU). A packet goes out as
-soon as it is full; `flush()` sends a partial one. Sequence numbers start at
+soon as it is full. `flush()` sends the whole TS packets waiting as a shorter
+one, and keeps an incomplete TS packet for the next write, since RFC 2250 allows
+only whole TS packets in a payload. For the same reason, `close()` discards an
+incomplete TS packet at the very end. Sequence numbers start at
 random, and timestamps are the 90 kHz send time, as RFC 2250 specifies.
 
 **Pacing is the caller's.** A live source (a capture card, a Roast connection, a
@@ -194,7 +197,16 @@ RtpSender.connect(senderConfig, transport);
 ```
 
 `close()` sends what is pending, says BYE, and returns once the ports can be
-bound again.
+bound again. Called on the receiver's or sender's own event loop (from a
+listener, say), it cannot wait for that without blocking the loop it would wait
+on, so the sockets close as soon as the loop is free and `close()` returns at
+once.
+
+With FEC, packets on the FEC ports are only accepted from the media source's
+address (FEC carries no usable SSRC). Rebuilt packets go through the same header
+checks as received ones, and FEC packets waiting to become useful are
+deduplicated and capped, so corrupt or hostile FEC cannot grow memory or inject
+malformed packets.
 
 ## Interoperability
 

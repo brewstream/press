@@ -104,6 +104,85 @@ class RtpReceiverFecTest {
         assertThat(stats.packetsRecoveredLate()).isEqualTo(3);
     }
 
+    /**
+     * FEC carries SSRC 0, so only the sender's address ties it to the stream. A
+     * datagram on the FEC port from another address must not repair anything.
+     */
+    @Test
+    void ignoresFecFromAnotherHost() throws Exception {
+        InetAddress other = java.net.NetworkInterface.networkInterfaces()
+                .flatMap(java.net.NetworkInterface::inetAddresses)
+                .filter(a -> a instanceof java.net.Inet4Address && !a.isLoopbackAddress())
+                .findFirst().orElse(null);
+        org.junit.jupiter.api.Assumptions.assumeTrue(other != null, "no second local address to send from");
+        start(Duration.ofMillis(200));
+        int base = receiver.localAddress().getPort();
+        try (DatagramSocket source = new DatagramSocket(0, LOOPBACK);
+                DatagramSocket foreign = new DatagramSocket(0, other)) {
+            sendMedia(source, base, 100);
+            awaitReceived(1);
+
+            // A row protecting 100 and 101: would rebuild 101 if it were accepted.
+            sendFec(foreign, base + 4, new FecPacket(1, 0, 0, false, 100, 0, 0, 0, true, 1, 2,
+                    Unpooled.buffer(1316).writeZero(1316)));
+            Thread.sleep(300);
+
+            assertThat(receiver.stats().packetsRecovered()).isZero();
+            assertThat(receiver.stats().packetsForeign()).isEqualTo(1);
+        }
+    }
+
+    /**
+     * A malformed rebuilt packet used to throw on the receiver's timer, which
+     * Netty then never ran again, so gaps stopped timing out. Here the FEC
+     * claims a header extension a one-byte body cannot hold. The gap it tried to
+     * fill, and a later one, must still time out.
+     */
+    @Test
+    void malformedFecLeavesGapsTimingOut() throws Exception {
+        start(Duration.ofMillis(100));
+        int base = receiver.localAddress().getPort();
+        try (DatagramSocket source = new DatagramSocket(0, LOOPBACK)) {
+            sendMedia(source, base, 0);
+            sendMedia(source, base, 3);
+            awaitReceived(2);
+            sendFec(source, base + 4, new FecPacket(1, 0, 0x10, false, 2, 1316 ^ 1, 0, 0, true, 1, 2,
+                    Unpooled.buffer(1316).writeZero(1316)));
+
+            assertThat(take(2)).containsExactly(0, 3);
+            sendMedia(source, base, 6);
+            assertThat(take(1)).as("a later gap still times out").containsExactly(6);
+        }
+    }
+
+    private static void sendMedia(DatagramSocket socket, int port, int seq) throws Exception {
+        ByteBuf payload = Unpooled.buffer(1316);
+        payload.writeByte(0x47);
+        payload.writeByte(seq & 0xFF);
+        payload.writeZero(1314);
+        ByteBuf wire = RtpPacket.of(false, 33, seq, seq * 900L, 0x5EC0L, payload).encode(ByteBufAllocator.DEFAULT);
+        payload.release();
+        byte[] bytes = ByteBufUtil.getBytes(wire);
+        wire.release();
+        socket.send(new DatagramPacket(bytes, bytes.length, LOOPBACK, port));
+    }
+
+    private static void sendFec(DatagramSocket socket, int port, FecPacket fec) throws Exception {
+        ByteBuf wire = fec.encode(ByteBufAllocator.DEFAULT);
+        fec.payload().release();
+        byte[] bytes = ByteBufUtil.getBytes(wire);
+        wire.release();
+        socket.send(new DatagramPacket(bytes, bytes.length, LOOPBACK, port));
+    }
+
+    private void awaitReceived(long count) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (receiver.stats().packetsReceived() < count && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertThat(receiver.stats().packetsReceived()).isEqualTo(count);
+    }
+
     private void start(Duration latency) throws Exception {
         receiver = RtpReceiver.bind(RtpReceiverConfig.unicast(new InetSocketAddress(LOOPBACK, 0))
                 .withFec(true).withLatency(latency));

@@ -131,24 +131,8 @@ public record RtpPacket(
         }
         int flags = b0 & 0x3F;
         int bodyLength = length - HEADER_LENGTH;
-        int consumed = 4 * (flags & 0x0F);
-        if (consumed > bodyLength) {
+        if (!wellFormed(flags, datagram, start + HEADER_LENGTH, bodyLength)) {
             return null;
-        }
-        if ((flags & 0x10) != 0) {
-            if (consumed + 4 > bodyLength) {
-                return null;
-            }
-            consumed += 4 + 4 * datagram.getUnsignedShort(start + HEADER_LENGTH + consumed + 2);
-            if (consumed > bodyLength) {
-                return null;
-            }
-        }
-        if ((flags & 0x20) != 0) {
-            int paddingLength = bodyLength == 0 ? 0 : datagram.getUnsignedByte(start + length - 1);
-            if (paddingLength == 0 || consumed + paddingLength > bodyLength) {
-                return null;
-            }
         }
         return new RtpPacket(
                 flags,
@@ -158,6 +142,38 @@ public record RtpPacket(
                 datagram.getUnsignedInt(start + 4),
                 datagram.getUnsignedInt(start + 8),
                 datagram.retainedSlice(start + HEADER_LENGTH, bodyLength));
+    }
+
+    /**
+     * Whether a body can hold what the P, X and CC bits in {@code flags} say it
+     * holds: the CSRC list, the header extension with its stated length, and
+     * padding whose count is non-zero and fits. {@link #payload()} relies on
+     * this. Used by {@link #decode}, and for packets rebuilt from FEC, whose
+     * flags are an XOR and so can claim anything.
+     */
+    public static boolean wellFormed(int flags, ByteBuf body) {
+        return wellFormed(flags, body, body.readerIndex(), body.readableBytes());
+    }
+
+    private static boolean wellFormed(int flags, ByteBuf buf, int bodyStart, int bodyLength) {
+        int consumed = 4 * (flags & 0x0F);
+        if (consumed > bodyLength) {
+            return false;
+        }
+        if ((flags & 0x10) != 0) {
+            if (consumed + 4 > bodyLength) {
+                return false;
+            }
+            consumed += 4 + 4 * buf.getUnsignedShort(bodyStart + consumed + 2);
+            if (consumed > bodyLength) {
+                return false;
+            }
+        }
+        if ((flags & 0x20) != 0) {
+            int paddingLength = bodyLength == 0 ? 0 : buf.getUnsignedByte(bodyStart + bodyLength - 1);
+            return paddingLength != 0 && consumed + paddingLength <= bodyLength;
+        }
+        return true;
     }
 
     /** Writes the fixed header and the body to {@code out}. Does not release the body. */
